@@ -23,7 +23,6 @@ const apiRequest = async (endpoint, options = {}) => {
   const headers = {
     'Accept': 'application/json',
     'X-DreamFactory-Api-Key': API_KEY,
-    'X-Requested-With': 'XMLHttpRequest', // Sometimes helps with CORS
   }
 
   // Only add Content-Type for POST/PUT/PATCH requests
