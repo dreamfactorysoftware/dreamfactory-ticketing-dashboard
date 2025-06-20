@@ -1,21 +1,29 @@
 // Configuration from environment variables
-const API_BASE_URL = import.meta.env.VITE_DF_API_BASE_URL
+const API_BASE_URL = import.meta.env.DEV 
+  ? '/api/v2' // Use proxy in development
+  : import.meta.env.VITE_DF_API_BASE_URL // Use direct URL in production
 const API_KEY = import.meta.env.VITE_DF_API_KEY
 const DB_SERVICE = import.meta.env.VITE_DF_DB_SERVICE || 'pgsqlTDAtest'
 const TABLE_NAME = import.meta.env.VITE_DF_TABLE_NAME || 'tickets'
 
 // API request function for DreamFactory
 const apiRequest = async (endpoint, options = {}) => {
-  const url = `${API_BASE_URL}${endpoint}`
+  // Check if API base URL is available
+  if (!API_BASE_URL) {
+    throw new Error('DreamFactory API base URL is required. Please set VITE_DF_API_BASE_URL environment variable.')
+  }
   
   // Check if API key is available
   if (!API_KEY) {
     throw new Error('DreamFactory API key is required. Please set VITE_DF_API_KEY environment variable.')
   }
+
+  const url = `${API_BASE_URL}${endpoint}`
   
   const headers = {
     'Accept': 'application/json',
     'X-DreamFactory-Api-Key': API_KEY,
+    'X-Requested-With': 'XMLHttpRequest', // Sometimes helps with CORS
   }
 
   // Only add Content-Type for POST/PUT/PATCH requests
@@ -26,6 +34,7 @@ const apiRequest = async (endpoint, options = {}) => {
   const config = {
     method: 'GET',
     mode: 'cors',
+    credentials: 'omit', // Explicitly set credentials to avoid CORS issues
     headers: {
       ...headers,
       ...options.headers,
@@ -33,18 +42,29 @@ const apiRequest = async (endpoint, options = {}) => {
     ...options,
   }
 
-  const response = await fetch(url, config)
-  
-  if (!response.ok) {
-    const errorData = await response.json().catch(() => ({ message: response.statusText }))
-    throw new Error(`API Error: ${response.status} - ${errorData.message || response.statusText}`)
-  }
+  try {
+    const response = await fetch(url, config)
+    
+    if (!response.ok) {
+      const errorData = await response.json().catch(() => ({ message: response.statusText }))
+      throw new Error(`API Error: ${response.status} - ${errorData.message || response.statusText}`)
+    }
 
-  return response.json()
+    return response.json()
+  } catch (error) {
+    // If it's a CORS error, provide more helpful debugging info
+    if (error.name === 'TypeError' && error.message.includes('fetch')) {
+      throw new Error(`CORS Error: Unable to connect to ${API_BASE_URL}. Please check if CORS is enabled for your domain on the DreamFactory server.`)
+    }
+    throw error
+  }
 }
 
 // Helper function to normalize ticket data from DreamFactory response
 const normalizeTicket = (ticket) => {
+  // Ensure we have valid dates, use current timestamp as fallback
+  const now = new Date().toISOString()
+  
   return {
     id: ticket.id,
     title: ticket.title,
@@ -54,8 +74,8 @@ const normalizeTicket = (ticket) => {
     requester_id: ticket.requester_id,
     assigned_to_id: ticket.assigned_to_id,
     category_id: ticket.category_id,
-    created_at: ticket.created_at,
-    updated_at: ticket.updated_at,
+    created_at: ticket.created_at || now,
+    updated_at: ticket.updated_at || ticket.created_at || now,
   }
 }
 
@@ -66,7 +86,7 @@ const normalizeComment = (comment) => {
     ticket_id: comment.ticket_id,
     user_id: comment.user_id,
     comment: comment.comment,
-    created_at: comment.created_at,
+    created_at: comment.created_at || new Date().toISOString(),
   }
 }
 
@@ -111,12 +131,60 @@ export const createTicket = async (ticketData) => {
 }
 
 export const updateTicket = async (id, updateData) => {
-  const response = await apiRequest(`/${DB_SERVICE}/_table/${TABLE_NAME}/${id}`, {
-    method: 'PATCH',
-    body: JSON.stringify(updateData)
-  })
-  
-  return normalizeTicket(response)
+  // Try with PUT method first (DreamFactory often prefers PUT over PATCH)
+  try {
+    const response = await apiRequest(`/${DB_SERVICE}/_table/${TABLE_NAME}/${id}`, {
+      method: 'PUT',
+      body: JSON.stringify(updateData)
+    })
+    
+    // If response only contains ID, fetch the complete updated ticket
+    if (response && Object.keys(response).length <= 2) {
+      const completeTicket = await getTicketById(id)
+      return completeTicket
+    }
+    
+    return normalizeTicket(response)
+  } catch (putError) {
+    console.log('PUT failed, trying PATCH:', putError.message)
+    
+    // If PUT fails, try PATCH without resource wrapper first
+    try {
+      const response = await apiRequest(`/${DB_SERVICE}/_table/${TABLE_NAME}/${id}`, {
+        method: 'PATCH',
+        body: JSON.stringify(updateData)
+      })
+      
+      // If response only contains ID, fetch the complete updated ticket
+      if (response && Object.keys(response).length <= 2) {
+        const completeTicket = await getTicketById(id)
+        return completeTicket
+      }
+      
+      return normalizeTicket(response)
+    } catch (patchError) {
+      console.log('PATCH (simple) failed, trying with resource wrapper:', patchError.message)
+      
+      // Last resort: try PATCH with resource wrapper
+      const response = await apiRequest(`/${DB_SERVICE}/_table/${TABLE_NAME}/${id}`, {
+        method: 'PATCH',
+        body: JSON.stringify({
+          resource: [updateData]
+        })
+      })
+      
+      // Response might be wrapped in resource array
+      const updatedTicket = response.resource ? response.resource[0] : response
+      
+      // If response only contains ID, fetch the complete updated ticket
+      if (updatedTicket && Object.keys(updatedTicket).length <= 2) {
+        const completeTicket = await getTicketById(id)
+        return completeTicket
+      }
+      
+      return normalizeTicket(updatedTicket)
+    }
+  }
 }
 
 export const deleteTicket = async (id) => {
